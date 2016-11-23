@@ -57,8 +57,6 @@ DataIterHandle = ctypes.c_void_p
 KVStoreHandle = ctypes.c_void_p
 RecordIOHandle = ctypes.c_void_p
 RtcHandle = ctypes.c_void_p
-OptimizerHandle = ctypes.c_void_p
-OptimizerCreator = ctypes.c_void_p
 #----------------------------
 # helper function definition
 #----------------------------
@@ -79,6 +77,7 @@ def check_call(ret):
 if sys.version_info[0] < 3:
     def c_str(string):
         """Create ctypes char * from a python string
+
         Parameters
         ----------
         string : string type
@@ -93,6 +92,7 @@ if sys.version_info[0] < 3:
 else:
     def c_str(string):
         """Create ctypes char * from a python string
+
         Parameters
         ----------
         string : string type

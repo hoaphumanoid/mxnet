@@ -11,7 +11,6 @@
 #include <mxnet/base.h>
 #include <mxnet/ndarray.h>
 #include <mxnet/operator.h>
-#include <mxnet/optimizer.h>
 #include <mxnet/io.h>
 #include <mxnet/c_api.h>
 #include <mxnet/kvstore.h>
@@ -25,6 +24,7 @@
 #include <utility>
 #include "./c_api_common.h"
 #include "../operator/custom-inl.h"
+#include "../engine/profiler.h"
 
 using namespace mxnet;
 
@@ -73,6 +73,20 @@ int MXRandomSeed(int seed) {
 int MXNotifyShutdown() {
   API_BEGIN();
   Engine::Get()->NotifyShutdown();
+  API_END();
+}
+
+int MXSetProfilerConfig(int mode, const char* filename) {
+  API_BEGIN();
+  // mode, kOnlySymbolic: 0, kAllOperator: 1
+  engine::Profiler::Get()->SetConfig(engine::Profiler::ProfilerMode(mode), std::string(filename));
+  API_END();
+}
+
+int MXSetProfilerState(int state) {
+  API_BEGIN();
+  // state, kNotRunning: 0, kRunning: 1
+  engine::Profiler::Get()->SetState(engine::Profiler::ProfilerState(state));
   API_END();
 }
 
@@ -827,52 +841,6 @@ int MXRtcFree(RtcHandle handle) {
 #else
   LOG(FATAL) << "Need to compile with USE_CUDA=1 and USE_NVRTC=1 for MXRtc.";
 #endif  // ((MXNET_USE_CUDA) && (MXNET_USE_NVRTC))
-  API_END();
-}
-
-int MXOptimizerFindCreator(const char *key,
-                           OptimizerCreator *out) {
-  API_BEGIN();
-  *out = (OptimizerCreator*)dmlc::Registry<OptimizerReg>::Find(key);  // NOLINT(*)
-  API_END();
-}
-
-int MXOptimizerCreateOptimizer(OptimizerCreator creator,
-                               mx_uint num_param,
-                               const char **keys,
-                               const char **vals,
-                               OptimizerHandle *out) {
-  API_BEGIN();
-  OptimizerReg *e = static_cast<OptimizerReg *>(creator);
-  Optimizer* opt = e->body();
-  std::vector<std::pair<std::string, std::string> > kwargs;
-  for (mx_uint i = 0; i < num_param; ++i) {
-    kwargs.push_back({std::string(keys[i]), std::string(vals[i])});
-  }
-  opt->Init(kwargs);
-  *out = opt;
-  API_END();
-}
-
-int MXOptimizerFree(OptimizerHandle handle) {
-  API_BEGIN();
-  Optimizer *opt = static_cast<Optimizer*>(handle);
-  delete opt;
-  API_END();
-}
-
-int MXOptimizerUpdate(OptimizerHandle handle,
-                      int index,
-                      NDArrayHandle weight,
-                      NDArrayHandle grad,
-                      mx_float lr,
-                      mx_float wd) {
-  API_BEGIN();
-  Optimizer *opt = static_cast<Optimizer*>(handle);
-  opt->Update(index,
-              static_cast<NDArray*>(weight),
-              static_cast<NDArray*>(grad),
-              lr, wd);
   API_END();
 }
 

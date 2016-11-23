@@ -11,6 +11,7 @@
 
 #include "./exec_pass.h"
 #include "./graph_executor.h"
+#include "../engine/profiler.h"
 
 namespace mxnet {
 namespace exec {
@@ -70,23 +71,60 @@ const std::vector<NDArray>& GraphExecutor::outputs() const {
 
 nnvm::NodeEntry AggregateGradient(std::vector<nnvm::NodeEntry>&& v) {
   using nnvm::Op;
-  using nnvm::Node;
+  static size_t inplace_sum_cap = dmlc::GetEnv("MXNET_EXEC_INPLACE_GRAD_SUM_CAP", 8);
+  static const Op* ewise_plus_op = Op::Get("elemwise_add");
+  static const Op* ewise_sum_op = Op::Get("ElementWiseSum");
+  static const Op* identity_op = Op::Get("identity");
+  static const Op* zeros_op = Op::Get("_zeros");
+  // remove zero in the sum.
+  size_t begin = 0;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (v[i].node->op() != zeros_op) {
+      if (begin != i) {
+        v[begin] = std::move(v[i]);
+      }
+      ++begin;
+    }
+  }
+  v.resize(begin);
+
   if (v.size() == 1) {
     return std::move(v[0]);
   } else if (v.size() == 0) {
-    // TODO(tqchen) should be zero node
-    nnvm::NodePtr ng = Node::Create();
-    ng->attrs.op = Op::Get("_NoGradient");
-    ng->attrs.name = "NoGradient";
+    nnvm::NodePtr ng = nnvm::Node::Create();
+    ng->attrs.op = zeros_op;
+    ng->attrs.name = "zeros";
+    ng->attrs.op->attr_parser(&(ng->attrs));
     return nnvm::NodeEntry{ng, 0, 0};
   } else {
-    nnvm::NodePtr sum_node = Node::Create();
-    sum_node->attrs.op = Op::Get("ElementWiseSum");
-    sum_node->attrs.name = "sum_grad";
-    sum_node->attrs.dict["num_args"] = std::to_string(v.size());
-    sum_node->attrs.op->attr_parser(&(sum_node->attrs));
-    sum_node->inputs = std::move(v);
-    return nnvm::NodeEntry{sum_node, 0, 0};
+    if (v.size() < inplace_sum_cap) {
+      nnvm::NodePtr sum_node = nnvm::Node::Create();
+      sum_node->attrs.op = ewise_sum_op;
+      sum_node->attrs.name = "sum_grad";
+      sum_node->attrs.dict["num_args"] = std::to_string(v.size());
+      sum_node->attrs.op->attr_parser(&(sum_node->attrs));
+      sum_node->inputs = std::move(v);
+      return nnvm::NodeEntry{sum_node, 0, 0};
+    } else {
+      // use a stream line of plus instead
+      nnvm::NodeEntry ret = v[0];
+      for (size_t i = 1; i < v.size(); ++i) {
+        std::ostringstream os;
+        os << "sum_grad_" << i;
+        nnvm::NodePtr x = nnvm::Node::Create();
+        x->attrs.op = ewise_plus_op;
+        x->attrs.name = os.str();
+        x->inputs = {ret, v[i]};
+        ret = nnvm::NodeEntry{x, 0, 0};
+      }
+      // identity node is used to avoid exposure of dummy plus node
+      // when its output get assigned to another space.
+      nnvm::NodePtr id_node = nnvm::Node::Create();
+      id_node->attrs.op = identity_op;
+      id_node->attrs.name = "sum_grad_final";
+      id_node->inputs = {ret};
+      return nnvm::NodeEntry{id_node, 0, 0};
+    }
   }
 }
 
@@ -151,12 +189,14 @@ nnvm::Graph GraphExecutor::InitFullGraph(
     if (type == "CuDNNBatchNorm") return false;
     return true;
   };
-
+  // take gradient
   nnvm::Graph g_grad = nnvm::pass::Gradient(
       g, symbol.outputs, xs, head_grad_entry_,
       AggregateGradient, need_mirror);
   CHECK_EQ(g_grad.outputs.size(), xs.size());
-  g.outputs.insert(g.outputs.end(), g_grad.outputs.begin(), g_grad.outputs.end());
+  for (const auto &e : g_grad.outputs) {
+    g.outputs.push_back(e);
+  }
   return g;
 }
 
@@ -326,11 +366,12 @@ Graph GraphExecutor::InitGraph(nnvm::Symbol symbol,
         = grad_store_[j - num_forward_outputs_].second;
   }
   arg_shapes.resize(idx.input_nodes().size(), TShape());
-  arg_types.resize(idx.input_nodes().size(), 0);
+  arg_types.resize(idx.input_nodes().size(), -1);
   // other initializations
   g = nnvm::pass::InferShape(g, arg_shapes, "__shape__");
   g = nnvm::pass::InferType(g, arg_types);
   g = nnvm::ApplyPass(g, "PlanMemory");
+  g = DetectInplaceAddTo(g);
   return g;
 }
 
@@ -369,14 +410,14 @@ void GraphExecutor::InitDataEntryMemory(const std::vector<NDArray>& shared_pool)
     CHECK_NE(vshape[eid].ndim(), 0);
     CHECK_NE(vdtype[eid], -1);
     data_entry_[idx.entry_id(nid, 0)] =
-        NDArray(vshape[eid], data_context[eid], vdtype[eid]);
+        NDArray(vshape[eid], data_context[eid], false, vdtype[eid]);
   }
   // get maximum bytes in each pool
   for (size_t i = 0; i < vshape.size(); ++i) {
+    if (!data_entry_[i].is_none()) continue;
     size_t bytes = vshape[i].Size() * mshadow::mshadow_sizeof(vdtype[i]);
     int storage_id = vstorage[i];
     if (storage_id < 0) continue;
-    if (!data_entry_[i].is_none()) continue;
     size_t sid = static_cast<size_t>(storage_id);
     if (sid >= pool_info.size()) {
       pool_info.resize(sid + 1, PoolEntry{Context::CPU(), size_t(0)});
@@ -438,12 +479,23 @@ void GraphExecutor::InitCachedOps() {
   const auto& op_execs =
       graph_.GetAttr<OpExecVector>("op_execs");
   const auto& vctx = graph_.GetAttr<ContextVector>("context");
+  const auto& addto_entry = graph_.GetAttr<std::vector<int> >("addto_entry");
+  const auto& skip_plus_node = graph_.GetAttr<std::vector<int> >("skip_plus_node");
 
   op_nodes_.resize(idx.num_nodes());
   // setup the array and requirements.
   for (uint32_t nid = 0; nid < idx.num_nodes(); ++nid) {
     const auto& inode = idx[nid];
     if (inode.source->is_variable()) continue;
+#if MXNET_USE_PROFILER
+    op_nodes_[nid].opr_name = inode.source->op()->name.c_str();
+#else
+    op_nodes_[nid].opr_name = nullptr;
+#endif
+    if (skip_plus_node.at(nid)) {
+      op_nodes_[nid].skip_exec_node = true; continue;
+    }
+
     op_nodes_[nid].exec = op_execs[nid];
     op_nodes_[nid].ctx = vctx[nid];
     auto& exec = op_nodes_[nid].exec;
@@ -456,7 +508,9 @@ void GraphExecutor::InitCachedOps() {
     for (uint32_t index = 0; index < inode.source->num_outputs(); ++index) {
       uint32_t eid = idx.entry_id(nid, index);
       exec->out_array.push_back(data_entry_[eid]);
-      if (vstorage_inplace[eid] >= 0) {
+      if (addto_entry.at(eid) != 0) {
+        exec->req.push_back(kAddTo);
+      } else if (vstorage_inplace[eid] >= 0) {
         exec->req.push_back(kWriteInplace);
       } else if (vstorage_inplace[eid] == -2) {
         // -2 indicate that the entry is never referenced.
@@ -466,20 +520,22 @@ void GraphExecutor::InitCachedOps() {
       }
     }
   }
+  // Note that this modifies the requirment of kWriteInplace
   for (size_t j = num_forward_outputs_; j < idx.outputs().size(); ++j) {
     auto& e = idx.outputs()[j];
     op_nodes_[e.node_id].exec->req[e.index] =
         grad_store_[j - num_forward_outputs_].first;
   }
-
   for (uint32_t nid = 0; nid < idx.num_nodes(); ++nid) {
     const auto& inode = idx[nid];
     if (inode.source->is_variable()) continue;
+    if (op_nodes_[nid].skip_exec_node) continue;
     auto& exec = op_nodes_[nid].exec;
 
     std::vector<uint32_t> inplace_inputs;
     for (uint32_t index = 0; index < inode.source->num_outputs(); ++index) {
       uint32_t eid = idx.entry_id(nid, index);
+      // must check exec->req because, vstorage_inplace is only a hint.
       if (vstorage_inplace[eid] >= 0 && exec->req.at(index) == kWriteInplace) {
         inplace_inputs.push_back(vstorage_inplace[eid]);
       }
@@ -510,14 +566,18 @@ void GraphExecutor::InitCachedOps() {
       vars.resize(std::unique(vars.begin(), vars.end()) - vars.begin());
     };
     dedup(use_vars);
+    for (auto v : use_vars) {
+      if (std::binary_search(mutate_vars.begin(), mutate_vars.end(), v)) {
+        LOG(FATAL) << "var duplication happens for op " << inode.source->attrs.name;
+      }
+    }
     dedup(mutate_vars);
     dedup(all_vars);
-
     Engine::Get()->PushSync([exec](RunContext rctx) {
         exec->Setup();
-      }, Context::CPU(), {}, all_vars);
-
-    auto exec_fun = [exec, is_async, is_gpu](
+      }, Context::CPU(), {}, all_vars, FnProperty::kNormal, 0,
+      PROFILER_MESSAGE("SetupExec"));
+    auto exec_fun = [exec, is_async, is_gpu] (
         RunContext ctx, Engine::CallbackOnComplete on_complete) {
       if (is_async) {
         exec->op_ctx.async_on_complete = on_complete;
@@ -537,8 +597,9 @@ void GraphExecutor::InitCachedOps() {
       }
     };
     // setup the vars
-    op_nodes_[nid].cached_opr =  Engine::Get()->NewOperator(
-        exec_fun, use_vars, mutate_vars, FnProperty::kNormal);
+    op_nodes_[nid].cached_opr = Engine::Get()->NewOperator(
+        exec_fun, use_vars, mutate_vars, FnProperty::kNormal,
+        PROFILER_MESSAGE(op_nodes_[nid].opr_name));
   }
 }
 
@@ -550,6 +611,7 @@ void GraphExecutor::RunOps(bool is_train, size_t topo_start, size_t topo_end) {
     const auto& inode = idx[nid];
     if (inode.source->is_variable()) continue;
     OpNode& opnode = op_nodes_[nid];
+    if (op_nodes_[nid].skip_exec_node) continue;
     opnode.exec->op_ctx.is_train = is_train;
     if (opnode.exec->exec_type() == Operator::kCrossDeviceCopy) {
       CHECK_EQ(inode.inputs.size(), 1);
@@ -557,7 +619,12 @@ void GraphExecutor::RunOps(bool is_train, size_t topo_start, size_t topo_end) {
       CHECK_EQ(opnode.exec->out_array.size(), 1);
       CopyFromTo(opnode.exec->in_array[0], &(opnode.exec->out_array[0]));
     } else if (opnode.cached_opr != nullptr) {
-      Engine::Get()->Push(opnode.cached_opr, opnode.ctx);
+#if MXNET_USE_PROFILER
+      bool profiling = engine::Profiler::Get()->GetState() == engine::Profiler::kRunning;
+#else
+      bool profiling = false;
+#endif
+      Engine::Get()->Push(opnode.cached_opr, opnode.ctx, 0, profiling);
     } else {
       LOG(FATAL) << "Not accessed";
     }

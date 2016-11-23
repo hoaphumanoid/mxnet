@@ -48,10 +48,14 @@ class GraphExecutor : public Executor {
  protected:
   // Information about operational node
   struct OpNode {
+    // The name of the operator
+    const char* opr_name;
     // the context of the node
     Context ctx;
     // The executor
     std::shared_ptr<OpExecutor> exec;
+    // skip the execution of this node
+    bool skip_exec_node{false};
     // cached operator handle
     Engine::OprHandle cached_opr{nullptr};
   };

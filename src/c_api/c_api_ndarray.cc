@@ -56,7 +56,7 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
     infered_num_inputs = op->num_inputs;
   }
   CHECK_EQ(num_inputs, infered_num_inputs)
-    << infered_num_inputs << " needed, " << num_inputs << " given";
+    << "Expecting " << infered_num_inputs << " inputs, got " << num_inputs;
   int infered_num_outputs;
   if (op->get_num_outputs != nullptr) {
     infered_num_outputs = op->get_num_outputs(attrs);
@@ -74,7 +74,7 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
     ndoutputs.resize(infered_num_outputs);
   } else {
     CHECK_EQ(infered_num_outputs, *num_outputs)
-      << infered_num_outputs << " needed, " << *num_outputs << " given";
+      << "Expecting " << infered_num_outputs << " outputs, got " << *num_outputs;
     ndoutputs.reserve(infered_num_outputs);
     for (int i = 0; i < infered_num_outputs; ++i) {
       ndoutputs.emplace_back(std::move(*outarray[i]));
@@ -84,6 +84,22 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
   if (ndfunc.count(op)) {
     ndfunc[op](attrs, ndinputs, &ndoutputs);
   } else {
+    // TODO(piiswrong): infer ctx
+    Context ctx;
+    if (num_inputs) {
+      ctx = ndinputs[0].ctx();
+    } else if (*num_outputs && !ndoutputs[0].is_none()) {
+      ctx = ndoutputs[0].ctx();
+    } else if (attrs.dict.find("ctx") != attrs.dict.end()) {
+      ctx = Context::FromString(attrs.dict["ctx"]);
+    } else {
+      ctx = Context::CPU();
+    }
+    // Pinned context doesn't propagate
+    if (ctx.dev_type == Context::kCPUPinned) {
+      ctx = Context::CPU();
+    }
+
     std::vector<TShape>& in_shapes = ret->arg_shapes;
     std::vector<TShape>& out_shapes = ret->out_shapes;
     in_shapes.clear();
@@ -92,10 +108,12 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
     for (auto& i : ndinputs) {
       in_shapes.emplace_back(i.shape());
     }
-    out_shapes.resize(infered_num_outputs);
+    for (auto& i : ndoutputs) {
+      out_shapes.emplace_back(i.shape());
+    }
     CHECK(infershape.count(op)) << "Op must have FInferShape registered";
     CHECK(infershape[op](attrs, &in_shapes, &out_shapes));
-    CHECK_EQ(out_shapes.size(), infered_num_outputs);
+    CHECK_EQ(out_shapes.size(), static_cast<size_t>(infered_num_outputs));
 
     std::vector<int>& in_types = ret->arg_types;
     std::vector<int>& out_types = ret->out_types;
@@ -105,26 +123,25 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
     for (auto& i : ndinputs) {
       in_types.push_back(i.dtype());
     }
-    out_types.resize(infered_num_outputs);
+    for (auto& i : ndoutputs) {
+      out_types.push_back(i.dtype());
+    }
     CHECK(infertype.count(op)) << "Op must have FInferShape registered";
     CHECK(infertype[op](attrs, &in_types, &out_types));
-    CHECK_EQ(out_types.size(), infered_num_outputs);
-
-    // TODO(piiswrong): infer ctx
-    Context ctx;
-    if (num_inputs) {
-      ctx = ndinputs[0].ctx();
-    } else if (*num_outputs) {
-      CHECK(!ndoutputs[0].is_none())
-        << "Op without input must have initialized output";
-      ctx = ndoutputs[0].ctx();
-    } else {
-      LOG(FATAL) << "Need at least one input or output";
-    }
+    CHECK_EQ(out_types.size(), static_cast<size_t>(infered_num_outputs));
 
     for (int i = 0; i < infered_num_outputs; ++i) {
       if (ndoutputs[i].is_none()) {
         ndoutputs[i] = NDArray(out_shapes[i], ctx, true, out_types[i]);
+      } else {
+        CHECK_EQ(ndoutputs[i].shape(), out_shapes[i])
+          << i << "th output has invalid shape. "
+          << "Expecting " << out_shapes[i] << " got "
+          << ndoutputs[i].shape();
+        CHECK_EQ(ndoutputs[i].dtype(), out_types[i])
+          << i << "th output has invalid shape. "
+          << "Expecting " << out_types[i] << " got "
+          << ndoutputs[i].dtype();
       }
     }
 
@@ -192,7 +209,8 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
             rctx.get_stream<gpu>()->Wait();
           }
           on_complete();
-        }, ctx, read_vars, write_vars);
+        }, ctx, read_vars, write_vars, FnProperty::kNormal,
+        0, PROFILER_MESSAGE(op->name.c_str()));
     } else if (createop.count(op)) {
       Operator* opr = createop[op](attrs, ctx, in_shapes, in_types);
       struct Capture {
@@ -205,7 +223,7 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
             engine::CallbackOnComplete on_complete) {
           std::vector<TBlob> input_blobs, aux_blobs, output_blobs;
           auto atop = auxidx.begin();
-          for (int i = 0; i < ndinputs.size(); ++i) {
+          for (size_t i = 0; i < ndinputs.size(); ++i) {
             if (atop != auxidx.end() && i == *atop) {
               aux_blobs.push_back(ndinputs[i].data());
               ++atop;
@@ -237,7 +255,8 @@ int MXImperativeInvoke(AtomicSymbolCreator creator,
             delete capture;
             on_complete();
           }
-        }, ctx, read_vars, write_vars);
+        }, ctx, read_vars, write_vars, FnProperty::kNormal,
+        0, PROFILER_MESSAGE(op->name.c_str()));
     } else {
       LOG(FATAL)
         << "Operator " << op->name

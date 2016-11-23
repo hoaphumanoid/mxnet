@@ -45,7 +45,7 @@ Refer to the next section for how to build it from the very source.
 Build
 ------------
 
-Checkout the [Installation Guide](http://mxnet.readthedocs.org/en/latest/how_to/build.html) contains instructions to install mxnet.
+Checkout the [Installation Guide](http://mxnet.io/get_started/setup.html) contains instructions to install mxnet.
 Then you can compile the Scala Package by
 
 ```bash
@@ -56,6 +56,12 @@ make scalapkg
 
 ```bash
 make scalatest
+```
+
+Or run a subset of unit tests by, e.g.,
+
+```bash
+make SCALA_TEST_ARGS=-Dsuites=ml.dmlc.mxnet.NDArraySuite scalatest
 ```
 
 If everything goes well, you will find jars for `assembly`, `core` and `example` modules.
@@ -74,7 +80,7 @@ java -Xmx4m -cp \
 ```
 
 If you've compiled with `USE_DIST_KVSTORE` enabled, the python tools in `mxnet/tracker` can be used to launch distributed training.
-The following command runs the above example using 2 worker nodes (and 2 server nodes) in local. Refer to [Distributed Training](http://mxnet.readthedocs.org/en/latest/distributed_training.html) for more details.
+The following command runs the above example using 2 worker nodes (and 2 server nodes) in local. Refer to [Distributed Training](http://mxnet.io/how_to/multi_devices.html) for more details.
 
 ```bash
 tracker/dmlc_local.py -n 2 -s 2 \
@@ -157,7 +163,7 @@ while (valDataIter.hasNext) {
 val y = NDArray.concatenate(labels)
 
 // get predicted labels
-val py = NDArray.argmaxChannel(prob)
+val py = NDArray.argmax_channel(prob)
 require(y.shape == py.shape)
 
 // calculate accuracy

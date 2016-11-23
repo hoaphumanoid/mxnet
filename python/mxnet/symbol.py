@@ -16,7 +16,7 @@ from .base import c_array, c_str, mx_uint, py_str, string_types, mx_real_t
 from .base import NDArrayHandle, ExecutorHandle, SymbolHandle
 from .base import check_call
 from .context import Context
-from .ndarray import NDArray, zeros, _DTYPE_NP_TO_MX, _DTYPE_MX_TO_NP
+from .ndarray import NDArray, zeros as _nd_zeros, _DTYPE_NP_TO_MX, _DTYPE_MX_TO_NP
 from .executor import Executor
 from . import _symbol_internal as _internal
 from .attribute import AttrScope
@@ -41,6 +41,11 @@ class Symbol(SymbolBase):
     # disable dictionary storage, also do not have parent type.
     # pylint: disable=no-member
     __slots__ = []
+
+    def __repr__(self):
+        """Get a string representation of the symbol."""
+        return '<%s %s>' % (self.__class__.__name__,
+                            self.name)
 
     def __add__(self, other):
         if isinstance(other, Symbol):
@@ -628,7 +633,7 @@ class Symbol(SymbolBase):
                         arg_handles.append(None)
                         arg_arrays.append(None)
                     else:
-                        raise ValueError('Must specify all the arguments in %s' % arg_key)
+                        raise ValueError('key `%s` is missing in `%s`' % (name, arg_key))
         else:
             raise TypeError('Only Accept list of NDArrays or dict of str to NDArray')
         return c_array(NDArrayHandle, arg_handles), arg_arrays
@@ -696,18 +701,18 @@ class Symbol(SymbolBase):
 
         # alloc space
         arg_ndarrays = [
-            zeros(shape, dev, dtype=dtype)
+            _nd_zeros(shape, dev, dtype=dtype)
             for dtype, dev, shape in zip(arg_types, arg_ctx, arg_shapes)]
         if grad_req != 'null':
             grad_ndarrays = {}
             for name, shape, dev, dtype in zip(
                     self.list_arguments(), arg_shapes, arg_ctx, arg_types):
                 if not isinstance(grad_req, dict) or grad_req[name] != 'null':
-                    grad_ndarrays[name] = zeros(shape, dev, dtype=dtype)
+                    grad_ndarrays[name] = _nd_zeros(shape, dev, dtype=dtype)
         else:
             grad_ndarrays = None
 
-        aux_ndarrays = [zeros(shape, dev, dtype=dtype)
+        aux_ndarrays = [_nd_zeros(shape, dev, dtype=dtype)
                         for shape, dev, dtype in zip(aux_shapes, aux_ctx, aux_types)]
         executor = self.bind(ctx, arg_ndarrays,
                              grad_ndarrays, grad_req, aux_ndarrays,
@@ -768,7 +773,7 @@ class Symbol(SymbolBase):
 
         Returns
         -------
-        executor : mxnet.Executor
+        executor : Executor
             The generated Executor
 
         Notes
@@ -1066,5 +1071,31 @@ def minimum(left, right):
         return _internal._MinimumScalar(right, scalar=left)
     if isinstance(left, Number) and isinstance(right, Number):
         return left if left > right else right
+    else:
+        raise TypeError('types (%s, %s) not supported' % (str(type(left)), str(type(right))))
+
+
+# pylint: disable=no-member
+# pylint: disable=redefined-builtin
+def hypot(left, right):
+    """ minimum left and right
+
+    Parameters
+    ---------
+    left: Symbol or Number
+    right: Symbol or Number
+
+    Returns
+    -------
+    result: Symbol or Number
+    """
+    if isinstance(left, Symbol) and isinstance(right, Symbol):
+        return _internal._Hypot(left, right)
+    if isinstance(left, Symbol) and isinstance(right, Number):
+        return _internal._HypotScalar(left, scalar=right)
+    if isinstance(left, Number) and isinstance(right, Symbol):
+        return _internal._HypotScalar(right, scalar=left)
+    if isinstance(left, Number) and isinstance(right, Number):
+        return _numpy.hypot(left, right)
     else:
         raise TypeError('types (%s, %s) not supported' % (str(type(left)), str(type(right))))

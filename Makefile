@@ -45,6 +45,11 @@ else
 	NVCCFLAGS = -std=c++11 -Xcompiler -D_FORCE_INLINES -g -O3 -ccbin $(CXX) $(MSHADOW_NVCCFLAGS)
 endif
 
+# CFLAGS for profiler
+ifeq ($(USE_PROFILER), 1)
+	CFLAGS += -DMXNET_USE_PROFILER=1
+endif
+
 ifndef LINT_LANG
 	LINT_LANG="all"
 endif
@@ -60,6 +65,34 @@ endif
 
 ifeq ($(USE_OPENMP), 1)
 	CFLAGS += -fopenmp
+endif
+
+ifeq ($(USE_NNPACK), 1)
+	CFLAGS += -DMXNET_USE_NNPACK=1
+	CFLAGS += -DMXNET_USE_NNPACK_NUM_THREADS=$(USE_NNPACK_NUM_THREADS)
+	LDFLAGS += -lnnpack
+endif
+
+ifeq ($(USE_MKL2017), 1)
+	CFLAGS += -DMXNET_USE_MKL2017=1
+	CFLAGS += -DUSE_MKL=1
+ifeq ($(USE_MKL2017_EXPERIMENTAL), 1)
+	CFLAGS += -DMKL_EXPERIMENTAL=1
+else
+	CFLAGS += -DMKL_EXPERIMENTAL=0
+endif
+ifneq ($(USE_BLAS), mkl)
+	ICC_ON=0
+	RETURN_STRING=$(shell ./prepare_mkl.sh $(ICC_ON))
+	MKLROOT=$(firstword $(RETURN_STRING))
+	MKL_LDFLAGS=-l$(word 2, $(RETURN_STRING))
+	MKL_EXTERNAL=$(lastword $(RETURN_STRING))
+ifeq ($(MKL_EXTERNAL), 1)
+	MKL_LDFLAGS+=-Wl,-rpath,$(MKLROOT)/lib
+	CFLAGS += -I$(MKLROOT)/include
+	LDFLAGS += -Wl,--as-needed -L$(MKLROOT)/lib/ -liomp5 -lmklml_intel
+endif
+endif
 endif
 
 ifeq ($(USE_CUDNN), 1)
@@ -98,16 +131,16 @@ endif
 
 all: lib/libmxnet.a lib/libmxnet.so $(BIN)
 
-SRC = $(wildcard src/*.cc src/*/*.cc src/*/*/*.cc)
+SRC = $(wildcard src/*/*/*.cc src/*/*.cc src/*.cc)
 OBJ = $(patsubst %.cc, build/%.o, $(SRC))
-CUSRC = $(wildcard src/*.cu src/*/*.cu src/*/*/*.cu)
+CUSRC = $(wildcard src/*/*/*.cu src/*/*.cu src/*.cu)
 CUOBJ = $(patsubst %.cu, build/%_gpu.o, $(CUSRC))
 
 # extra operators
 ifneq ($(EXTRA_OPERATORS),)
-	EXTRA_SRC = $(wildcard $(patsubst %, %/*.cc %/*/*.cc, $(EXTRA_OPERATORS)))
+	EXTRA_SRC = $(wildcard $(patsubst %, %/*.cc, $(EXTRA_OPERATORS)) $(patsubst %, %/*/*.cc, $(EXTRA_OPERATORS)))
 	EXTRA_OBJ = $(patsubst %.cc, %.o, $(EXTRA_SRC))
-	EXTRA_CUSRC = $(wildcard $(patsubst %, %/*.cu %/*/*.cu, $(EXTRA_OPERATORS)))
+	EXTRA_CUSRC = $(wildcard $(patsubst %, %/*.cu, $(EXTRA_OPERATORS)) $(patsubst %, %/*/*.cu, $(EXTRA_OPERATORS)))
 	EXTRA_CUOBJ = $(patsubst %.cu, %_gpu.o, $(EXTRA_CUSRC))
 else
 	EXTRA_SRC =
@@ -151,14 +184,6 @@ else
 endif
 
 # For quick compile test, used smaller subset
-ALLX_DEP = $(filter-out build/src/operator/%, $(ALL_DEP))
-ALLX_DEP+= build/src/operator/fully_connected.o
-ALLX_DEP+= build/src/operator/fully_connected_gpu.o
-ALLX_DEP+= build/src/operator/operator.o
-ALLX_DEP+= build/src/operator/operator_util.o
-ALLX_DEP+= build/src/operator/elementwise_unary_op.o
-ALLX_DEP+= build/src/operator/custom.o
-
 ALLX_DEP= $(ALL_DEP)
 
 ifeq ($(USE_NVRTC), 1)
@@ -207,9 +232,9 @@ lib/libmxnet.a: $(ALLX_DEP)
 	ar crv $@ $(filter %.o, $?)
 
 lib/libmxnet.so: $(ALLX_DEP)
-	@mkdir -p $(@D)
-	$(CXX) $(CFLAGS) -shared -o $@ $(filter %.o, $^) $(LDFLAGS) \
-	-Wl,${WHOLE_ARCH} $(filter %.a, $^) -Wl,${NO_WHOLE_ARCH}
+	 @mkdir -p $(@D)
+	 $(CXX) $(CFLAGS) -shared -o $@ $(filter-out %libnnvm.a, $(filter %.o %.a, $^)) $(LDFLAGS) \
+	 -Wl,${WHOLE_ARCH} $(filter %libnnvm.a, $^) -Wl,${NO_WHOLE_ARCH}
 
 $(PS_PATH)/build/libps.a: PSLITE
 
@@ -219,7 +244,7 @@ PSLITE:
 $(DMLC_CORE)/libdmlc.a: DMLCCORE
 
 DMLCCORE:
-	+ cd $(DMLC_CORE); make libdmlc.a config=$(ROOTDIR)/$(config); cd $(ROOTDIR)
+	+ cd $(DMLC_CORE); make libdmlc.a USE_SSE=$(USE_SSE) config=$(ROOTDIR)/$(config); cd $(ROOTDIR)
 
 $(NNVM_PATH)/lib/libnnvm.a:
 	+ cd $(NNVM_PATH); make lib/libnnvm.a; cd $(ROOTDIR)
@@ -259,19 +284,19 @@ cyclean:
 rcpplint:
 	python2 dmlc-core/scripts/lint.py mxnet-rcpp ${LINT_LANG} R-package/src
 
-rcppexport:
-	Rscript -e "require(mxnet); mxnet::mxnet.export(\"R-package\")"
-
-roxygen:
-	Rscript -e "require(roxygen2); roxygen2::roxygenise(\"R-package\")"
-
-rpkg:	roxygen
+rpkg:
 	mkdir -p R-package/inst
 	mkdir -p R-package/inst/libs
 	cp -rf lib/libmxnet.so R-package/inst/libs
 	mkdir -p R-package/inst/include
 	cp -rf include/* R-package/inst/include
 	cp -rf dmlc-core/include/* R-package/inst/include/
+	cp -rf nnvm/include/* R-package/inst/include
+	echo "import(Rcpp)" > R-package/NAMESPACE
+	echo "import(methods)" >> R-package/NAMESPACE
+	R CMD INSTALL R-package
+	Rscript -e "require(mxnet); mxnet:::mxnet.export(\"R-package\")"
+	Rscript -e "require(roxygen2); roxygen2::roxygenise(\"R-package\")"
 	R CMD build --no-build-vignettes R-package
 
 scalapkg:
@@ -303,14 +328,15 @@ jnilint:
 
 ifneq ($(EXTRA_OPERATORS),)
 clean: cyclean
-	$(RM) -r build lib bin *~ */*~ */*/*~ */*/*/*~
+	$(RM) -r build lib bin *~ */*~ */*/*~ */*/*/*~ R-package/NAMESPACE R-package/man R-package/R/mxnet_generated.R
 	cd $(DMLC_CORE); make clean; cd -
 	cd $(PS_PATH); make clean; cd -
 	cd $(NNVM_PATH); make clean; cd -
-	$(RM) -r  $(patsubst %, %/*.d %/*/*.d %/*.o %/*/*.o, $(EXTRA_OPERATORS))
+	$(RM) -r  $(patsubst %, %/*.d, $(EXTRA_OPERATORS)) $(patsubst %, %/*/*.d, $(EXTRA_OPERATORS))
+	$(RM) -r  $(patsubst %, %/*.o, $(EXTRA_OPERATORS)) $(patsubst %, %/*/*.o, $(EXTRA_OPERATORS))
 else
 clean: cyclean
-	$(RM) -r build lib bin *~ */*~ */*/*~ */*/*/*~
+	$(RM) -r build lib bin *~ */*~ */*/*~ */*/*/*~ R-package/NAMESPACE R-package/man R-package/R/mxnet_generated.R
 	cd $(DMLC_CORE); make clean; cd -
 	cd $(PS_PATH); make clean; cd -
 	cd $(NNVM_PATH); make clean; cd -
@@ -323,5 +349,5 @@ clean_all: clean
 -include build/*/*/*.d
 -include build/*/*/*/*.d
 ifneq ($(EXTRA_OPERATORS),)
-	-include $(patsubst %, %/*.d %/*/*.d, $(EXTRA_OPERATORS))
+	-include $(patsubst %, %/*.d, $(EXTRA_OPERATORS)) $(patsubst %, %/*/*.d, $(EXTRA_OPERATORS))
 endif
